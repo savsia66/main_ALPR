@@ -1,0 +1,18 @@
+# Python Environment
+.venv/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE Settings (VS Code)
+.vscode/
+
+# Windows System Files
+Thumbs.db
+desktop.ini
+
+# Project Specific (ALPR)
+# If your code saves detected plate images to a folder, ignore it:
+# detections/
