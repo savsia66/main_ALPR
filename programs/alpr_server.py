@@ -3,9 +3,18 @@ import cv2
 import pandas as pd
 import easyocr
 import difflib
+import numpy as np
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+
+
+app = Flask(__name__)
+CORS(app)
 
 print("Initializing EasyOCR...")
 reader = easyocr.Reader(["ar", "en"], gpu=False)
+
+CSV_PATH = "./Rdata/labels.csv"
 
 
 def cleanup_text(text):
@@ -58,14 +67,8 @@ def find_best_match(detected_text, database_keys):
     best_score = 0.0
 
     for db_key in database_keys:
-        if abs(len(detected_clean) - len(db_key)) > 2:
+        if abs(len(detected_clean) - len(db_key)) > 1:
             continue
-
-        if db_key in detected_clean or db_key in detected_reversed:
-            score = 0.9
-            if score > best_score:
-                best_score = score
-                best_match = db_key
 
         similarity = difflib.SequenceMatcher(None, detected_clean, db_key).ratio()
 
@@ -76,94 +79,78 @@ def find_best_match(detected_text, database_keys):
     return best_match, best_score
 
 
-def check_access(image_path, csv_path, db_image_dir=None):
+PLATE_DATABASE = load_database(CSV_PATH)
+DB_KEYS = list(PLATE_DATABASE.keys())
+
+
+def process_image_from_memory(img):
     result = {
         "success": False,
         "matched": False,
         "matched_plate": None,
         "detected_plate": None,
         "confidence": 0.0,
-        "annotated_image": None,
         "message": "",
     }
 
-    if not os.path.exists(image_path):
-        result["message"] = "Image not found."
-        return result
-
-    img = cv2.imread(image_path)
     if img is None:
         result["message"] = "Failed to load image."
         return result
 
     result["success"] = True
-    result["annotated_image"] = img.copy()
-
-    plate_database = load_database(csv_path)
-    db_keys = list(plate_database.keys())
 
     try:
         ocr_results = reader.readtext(img)
 
-        best_candidate = None
-        best_bbox = None
         best_conf = 0.0
+        best_candidate = None
 
         for bbox, text, prob in ocr_results:
             prob = float(prob)
-
             if len(text) < 3:
                 continue
 
-            matched_key, match_score = find_best_match(text, db_keys)
+            matched_key, match_score = find_best_match(text, DB_KEYS)
 
             if matched_key:
                 result["matched"] = True
                 result["matched_plate"] = matched_key
                 result["detected_plate"] = text
                 result["confidence"] = prob
-
-                (tl, tr, br, bl) = bbox
-                cv2.rectangle(
-                    result["annotated_image"],
-                    (int(tl[0]), int(tl[1])),
-                    (int(br[0]), int(br[1])),
-                    (0, 255, 0),
-                    5,
-                )
-
-                filename_from_csv = plate_database[matched_key]
-                if db_image_dir and filename_from_csv:
-                    full_db_path = os.path.join(db_image_dir, filename_from_csv)
-                    result["db_image_path"] = (
-                        full_db_path if os.path.exists(full_db_path) else None
-                    )
-
                 result["message"] = f"ACCESS GRANTED (Match: {matched_key})"
                 return result
 
             if prob > best_conf:
                 best_conf = prob
                 best_candidate = cleanup_text(text)
-                best_bbox = bbox
 
         if best_candidate:
             result["detected_plate"] = best_candidate
             result["message"] = "ACCESS DENIED"
-            if best_bbox:
-                (tl, tr, br, bl) = best_bbox
-                cv2.rectangle(
-                    result["annotated_image"],
-                    (int(tl[0]), int(tl[1])),
-                    (int(br[0]), int(br[1])),
-                    (0, 0, 255),
-                    5,
-                )
         else:
-            result["message"] = "No Plate Detected"
+            result["message"] = "No Text Detected"
 
     except Exception as e:
         print(f"Backend Error: {e}")
         result["message"] = f"OCR Error: {e}"
 
     return result
+
+
+@app.route("/scan", methods=["POST"])
+def scan_plate():
+    if "image" not in request.files:
+        return jsonify({"error": "No image uploaded"}), 400
+
+    file = request.files["image"]
+
+    file_bytes = np.frombuffer(file.read(), np.uint8)
+    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+    data = process_image_from_memory(img)
+
+    return jsonify(data)
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)

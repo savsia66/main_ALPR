@@ -1,10 +1,10 @@
 import os
 import threading
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 import cv2
-import test3 as core
+import alpr_server as core
 
 BG_DARK = "#1E2838"
 BG_MID = "#2C3E50"
@@ -20,26 +20,32 @@ FONT_STATUS = ("Segoe UI", 16)
 FONT_LABEL = ("Segoe UI", 11)
 
 
-class ANPRApp:
+class ALPRApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("ANPR Access Control System")
+        self.root.title("ALPR Access Control System (Desktop Mode)")
         self.root.configure(bg=BG_DARK)
 
-        window_width = 1000
-        window_height = 625
-        self.center_window(window_width, window_height)
+        if not core.PLATE_DATABASE:
+            messagebox.showwarning(
+                "Database Empty", "Could not load database.csv from the server module."
+            )
+
+        window_width = 1100
+        window_height = 700
+        self.center_window_top(window_width, window_height)
 
         current_script_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.dirname(current_script_dir)
+        self.db_dir = os.path.join(current_script_dir, "Rdata", "raw_data")
+        if not os.path.exists(self.db_dir):
+            self.db_dir = os.path.join(project_root, "Rdata", "raw_data")
 
-        self.csv_path = os.path.join(project_root, "Rdata", "labels.csv")
-        self.db_dir = os.path.join(project_root, "Rdata", "raw_data")
         self.current_image_path = None
 
         header = tk.Label(
             root,
-            text="🛡️ Secure Gate ANPR System",
+            text="🛡️ Secure Gate ALPR System",
             font=FONT_HEADER,
             bg=BG_DARK,
             fg=TEXT_LIGHT,
@@ -59,7 +65,7 @@ class ANPRApp:
             activebackground=BG_MID,
             activeforeground=TEXT_LIGHT,
             relief=tk.FLAT,
-            width=24,
+            width=20,
             height=2,
             cursor="hand2",
         )
@@ -75,7 +81,7 @@ class ANPRApp:
             activebackground=BG_MID,
             activeforeground=TEXT_LIGHT,
             relief=tk.FLAT,
-            width=24,
+            width=20,
             height=2,
             state="disabled",
             cursor="hand2",
@@ -93,7 +99,6 @@ class ANPRApp:
 
         img_frame = tk.Frame(root, bg=BG_DARK)
         img_frame.pack(expand=True, fill="both", padx=50)
-
         img_frame.grid_columnconfigure(0, weight=1)
         img_frame.grid_columnconfigure(1, weight=1)
 
@@ -104,7 +109,6 @@ class ANPRApp:
         )
         self.frame_left.grid(row=0, column=0, padx=20, pady=10)
         self.frame_left.pack_propagate(False)
-
         self.lbl_img_left = tk.Label(
             self.frame_left,
             text="Scanned Image",
@@ -119,7 +123,6 @@ class ANPRApp:
         )
         self.frame_right.grid(row=0, column=1, padx=20, pady=10)
         self.frame_right.pack_propagate(False)
-
         self.lbl_img_right = tk.Label(
             self.frame_right,
             text="Database Match",
@@ -138,20 +141,11 @@ class ANPRApp:
         )
         footer.pack(side="bottom", pady=15)
 
-    def center_window(self, width, height):
+    def center_window_top(self, width, height):
         screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-
         x = (screen_width // 2) - (width // 2)
-        y = (screen_height // 2) - (height // 2)
-        y = y - 50
-
-        if x < 0:
-            x = 0
-        if y < 0:
-            y = 30
-
-        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        y = 0
+        self.root.geometry(f"{width}x{height}+{int(x)}+{int(y)}")
 
     def browse_image(self):
         file_path = filedialog.askopenfilename(
@@ -188,16 +182,80 @@ class ANPRApp:
     def start_check_thread(self):
         self.btn_check.config(state="disabled", text="PROCESSING...")
         self.lbl_status.config(text="Reading License Plate...", fg=STATUS_WARN)
-        thread = threading.Thread(target=self.run_check)
+        thread = threading.Thread(target=self.run_local_check)
         thread.start()
 
-    def run_check(self):
-        res = core.check_access(self.current_image_path, self.csv_path, self.db_dir)
-        self.root.after(0, self.update_ui_results, res)
+    def run_local_check(self):
+        if self.current_image_path is None:
+            return
+        img = cv2.imread(self.current_image_path)
+        if img is None:
+            return
+
+        ocr_results = core.reader.readtext(img)
+
+        best_conf = 0.0
+        result = {
+            "matched": False,
+            "plate": None,
+            "annotated_image": img.copy(),
+            "db_image_path": None,
+            "msg": "No Text Detected",
+        }
+
+        found_match = False
+
+        for bbox, text, prob in ocr_results:
+            prob = float(prob)
+            if len(text) < 3:
+                continue
+
+            (tl, tr, br, bl) = bbox
+            x_min, x_max = int(min(tl[0], bl[0])), int(max(tr[0], br[0]))
+            y_min, y_max = int(min(tl[1], tr[1])), int(max(bl[1], br[1]))
+
+            matched_key, match_score = core.find_best_match(text, core.DB_KEYS)
+
+            if matched_key:
+                cv2.rectangle(
+                    result["annotated_image"],
+                    (x_min, y_min),
+                    (x_max, y_max),
+                    (0, 255, 0),
+                    4,
+                )
+
+                result["matched"] = True
+                result["plate"] = matched_key
+                result["msg"] = f"ACCESS GRANTED ({matched_key})"
+
+                filename = core.PLATE_DATABASE.get(matched_key)
+                if filename:
+                    full_path = os.path.join(self.db_dir, filename)
+                    if os.path.exists(full_path):
+                        result["db_image_path"] = full_path
+
+                found_match = True
+                break
+
+            else:
+                if prob > best_conf:
+                    best_conf = prob
+                    clean_txt = core.cleanup_text(text)
+                    result["plate"] = clean_txt
+                    result["msg"] = f"ACCESS DENIED | Detected: {clean_txt}"
+                    cv2.rectangle(
+                        result["annotated_image"],
+                        (x_min, y_min),
+                        (x_max, y_max),
+                        (0, 0, 255),
+                        4,
+                    )
+
+        self.root.after(0, self.update_ui_results, result)
 
     def update_ui_results(self, res):
-        if res["annotated_image"] is not None:
-            self.display_image(res["annotated_image"], self.lbl_img_left)
+        self.display_image(res["annotated_image"], self.lbl_img_left)
 
         if res["db_image_path"]:
             self.display_image(res["db_image_path"], self.lbl_img_right)
@@ -205,15 +263,10 @@ class ANPRApp:
             self.lbl_img_right.config(image="", text="No Database Image Found")
 
         if res["matched"]:
-            msg = f"✅ ACCESS GRANTED  |  Plate: {res['matched_plate']}"
-            self.lbl_status.config(text=msg, fg=STATUS_SUCCESS)
+            self.lbl_status.config(text=f"✅ {res['msg']}", fg=STATUS_SUCCESS)
             self.btn_check.config(bg=ACCENT_PRIMARY)
         else:
-            if res.get("detected_plate"):
-                msg = f"⛔ ACCESS DENIED  |  Plate: {res['detected_plate']}"
-            else:
-                msg = f"⛔ {res['message']}"
-            self.lbl_status.config(text=msg, fg=STATUS_DANGER)
+            self.lbl_status.config(text=f"⛔ {res['msg']}", fg=STATUS_DANGER)
             self.btn_check.config(bg=ACCENT_PRIMARY)
 
         self.btn_check.config(state="normal", text="🔍 CHECK ACCESS")
@@ -221,5 +274,5 @@ class ANPRApp:
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = ANPRApp(root)
+    app = ALPRApp(root)
     root.mainloop()
