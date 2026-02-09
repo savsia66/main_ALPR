@@ -3,9 +3,39 @@ import cv2
 import pandas as pd
 import easyocr
 import difflib
+import numpy as np
+import torch
+import pathlib
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
+# --- CONFIGURATION ---
+# Path to your trained YOLO model (best.pt) or the pre-trained weights
+MODEL_PATH = "./plate_model.pt"
+CSV_PATH = "./Rdata/labels.csv"
+
+app = Flask(__name__)
+CORS(app)
+
+# 1. LOAD OCR READER
 print("Initializing EasyOCR...")
 reader = easyocr.Reader(["ar", "en"], gpu=False)
+
+# 2. LOAD YOLO MODEL (The "Working Code" Logic) [cite: 7, 8]
+print(f"Loading YOLOv9 model from {MODEL_PATH}...")
+try:
+    # We use torch.hub to load the custom model exactly as your file did
+    # Note: 'source="github"' requires internet first time to download repo structure
+    model = torch.hub.load(
+        "WongKinYiu/yolov9", "custom", path=MODEL_PATH, force_reload=False
+    )
+    # Set confidence threshold to reduce garbage detections
+    model.conf = 0.5
+except Exception as e:
+    print(
+        f"CRITICAL ERROR: Could not load YOLO model. Ensure '{MODEL_PATH}' exists. Error: {e}"
+    )
+    model = None
 
 
 def cleanup_text(text):
@@ -17,237 +47,190 @@ def cleanup_text(text):
 def load_database(csv_path):
     try:
         if not os.path.exists(csv_path):
-            print(f"ERROR: CSV file not found at {os.path.abspath(csv_path)}")
             return {}
-
         df = pd.read_csv(csv_path)
-        df["plate_number"] = df["plate_number"].astype(str)
-
         col_img = "file_name"
         col_plate = "plate_number"
-
         if col_img not in df.columns or col_plate not in df.columns:
             return {}
-
         db_map = {}
         for index, row in df.iterrows():
             img_filename = str(row[col_img]).strip()
-            raw_plate = str(row[col_plate])
-            clean_plate = cleanup_text(raw_plate)
+            clean_plate = cleanup_text(str(row[col_plate]))
             db_map[clean_plate] = img_filename
-
-        print(f"DEBUG: Loaded {len(db_map)} plates from database.")
+        print(f"DEBUG: Loaded {len(db_map)} plates.")
         return db_map
-
     except Exception as e:
         print(f"Error loading CSV: {e}")
         return {}
 
 
+PLATE_DATABASE = load_database(CSV_PATH)
+DB_KEYS = list(PLATE_DATABASE.keys())
+
+
 def find_best_match(detected_text, database_keys):
     detected_clean = cleanup_text(detected_text)
-    detected_reversed = detected_clean[::-1]
-
     if detected_clean in database_keys:
         return detected_clean, 1.0
 
-    if detected_reversed in database_keys:
-        return detected_reversed, 0.95
+    # Reverse check
+    if detected_clean[::-1] in database_keys:
+        return detected_clean[::-1], 0.95
 
     best_match = None
     best_score = 0.0
-
     for db_key in database_keys:
-        if abs(len(detected_clean) - len(db_key)) > 1:
+        if abs(len(detected_clean) - len(db_key)) > 2:
             continue
-
         similarity = difflib.SequenceMatcher(None, detected_clean, db_key).ratio()
-
         if similarity > 0.85 and similarity > best_score:
             best_score = similarity
             best_match = db_key
-
     return best_match, best_score
 
 
-def get_yolo_crops(image, txt_path):
+# --- NEW LOGIC: YOLO DETECTION & CROP ---
+def detect_and_crop(img):
+    """
+    Uses YOLO to find the plate and returns the cropped image.
+    Based on working code[cite: 8, 9].
+    """
+    if model is None:
+        return []
+
+    # Inference
+    # YOLOv9 expects BGR or RGB. cv2 is BGR.
+    # We convert to RGB as seen in your working code [cite: 8]
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    results = model(img_rgb)
+
+    # Parse results [cite: 8]
+    # .xyxy[0] returns tensor of detections: [x1, y1, x2, y2, confidence, class]
+    detections = results.xyxy[0].cpu().numpy()
+
     crops = []
-    if not os.path.exists(txt_path):
-        return crops
 
-    h_img, w_img = image.shape[:2]
+    for box in detections:
+        x1, y1, x2, y2, conf, cls = box
 
-    try:
-        with open(txt_path, "r") as f:
-            lines = f.readlines()
+        # Convert to int for slicing
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
 
-        for line in lines:
-            parts = line.strip().split()
-            if len(parts) < 5:
-                continue
+        # Crop logic
+        # Ensure coordinates are within image bounds
+        h, w, _ = img.shape
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(w, x2)
+        y2 = min(h, y2)
 
-            x_center = float(parts[1])
-            y_center = float(parts[2])
-            width = float(parts[3])
-            height = float(parts[4])
+        # Crop the BGR image (original)
+        plate_crop = img[y1:y2, x1:x2]
 
-            x_c_px = x_center * w_img
-            y_c_px = y_center * h_img
-            w_px = width * w_img
-            h_px = height * h_img
-
-            x_min = int(max(0, x_c_px - (w_px / 2)))
-            y_min = int(max(0, y_c_px - (h_px / 2)))
-            x_max = int(min(w_img, x_c_px + (w_px / 2)))
-            y_max = int(min(h_img, y_c_px + (h_px / 2)))
-
-            if x_max > x_min and y_max > y_min:
-                crop = image[y_min:y_max, x_min:x_max]
-                crops.append((crop, (x_min, y_min, x_max, y_max)))
-    except Exception as e:
-        print(f"Warning: Failed to parse YOLO file {txt_path}: {e}")
+        if plate_crop.size > 0:
+            crops.append((plate_crop, conf))
 
     return crops
 
 
-def check_access(image_path, csv_path, db_image_dir=None):
+def process_image_from_memory(img):
     result = {
         "success": False,
         "matched": False,
         "matched_plate": None,
         "detected_plate": None,
         "confidence": 0.0,
-        "annotated_image": None,
-        "db_image_path": None,
         "message": "",
     }
 
-    if not os.path.exists(image_path):
-        result["message"] = "Image not found."
-        return result
-
-    img = cv2.imread(image_path)
     if img is None:
         result["message"] = "Failed to load image."
         return result
 
     result["success"] = True
-    result["annotated_image"] = img.copy()
-
-    plate_database = load_database(csv_path)
-    db_keys = list(plate_database.keys())
-
-    txt_path = os.path.splitext(image_path)[0] + ".txt"
-    crops_data = get_yolo_crops(img, txt_path)
-
-    best_candidate = None
-    best_conf = 0.0
-    best_box = None
 
     try:
-        if crops_data:
-            print("DEBUG: YOLO coordinates found. Using crop-based detection.")
-            for crop, (x1, y1, x2, y2) in crops_data:
-                ocr_results = reader.readtext(crop)
+        # STEP 1: Detect Plate using YOLO
+        crops = detect_and_crop(img)
 
-                for bbox, text, prob in ocr_results:
-                    prob = float(prob)
-                    if len(text) < 3:
-                        continue
+        if not crops:
+            result["message"] = "No License Plate Detected by YOLO."
+            return result
 
-                    matched_key, match_score = find_best_match(text, db_keys)
-                    if matched_key:
-                        result["matched"] = True
-                        result["matched_plate"] = matched_key
-                        result["detected_plate"] = text
-                        result["confidence"] = prob
+        # Sort crops by confidence (highest first)
+        crops.sort(key=lambda x: x[1], reverse=True)
 
-                        cv2.rectangle(
-                            result["annotated_image"],
-                            (x1, y1),
-                            (x2, y2),
-                            (0, 255, 0),
-                            5,
-                        )
+        best_candidate_text = None
+        best_candidate_conf = 0.0
 
-                        filename_from_csv = plate_database[matched_key]
-                        if db_image_dir and filename_from_csv:
-                            full_db_path = os.path.join(db_image_dir, filename_from_csv)
-                            result["db_image_path"] = (
-                                full_db_path if os.path.exists(full_db_path) else None
-                            )
+        # STEP 2: OCR only the cropped areas
+        for plate_img, detect_conf in crops:
 
-                        result["message"] = f"ACCESS GRANTED (Match: {matched_key})"
-                        return result
+            # Optional: Preprocess the crop slightly (grayscale) for EasyOCR
+            gray_plate = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
 
-                    if prob > best_conf:
-                        best_conf = prob
-                        best_candidate = cleanup_text(text)
-                        best_box = (x1, y1, x2, y2)
+            # Read text
+            ocr_results = reader.readtext(gray_plate)
 
-        else:
-            print("DEBUG: No YOLO coordinates found. Scanning full image with EasyOCR.")
-            ocr_results = reader.readtext(img)
+            for bbox, text, ocr_prob in ocr_results:
+                clean_txt = cleanup_text(text)
 
-            for bbox, text, prob in ocr_results:
-                prob = float(prob)
-                if len(text) < 3:
+                if len(clean_txt) < 3:
                     continue
 
-                (tl, tr, br, bl) = bbox
-                x_min = int(min(tl[0], bl[0]))
-                x_max = int(max(tr[0], br[0]))
-                y_min = int(min(tl[1], tr[1]))
-                y_max = int(max(bl[1], br[1]))
+                # Match against DB
+                matched_key, match_score = find_best_match(clean_txt, DB_KEYS)
 
-                curr_box = (x_min, y_min, x_max, y_max)
-
-                matched_key, match_score = find_best_match(text, db_keys)
                 if matched_key:
                     result["matched"] = True
                     result["matched_plate"] = matched_key
-                    result["detected_plate"] = text
-                    result["confidence"] = prob
-
-                    cv2.rectangle(
-                        result["annotated_image"],
-                        (curr_box[0], curr_box[1]),
-                        (curr_box[2], curr_box[3]),
-                        (0, 255, 0),
-                        5,
-                    )
-
-                    filename_from_csv = plate_database[matched_key]
-                    if db_image_dir and filename_from_csv:
-                        full_db_path = os.path.join(db_image_dir, filename_from_csv)
-                        result["db_image_path"] = (
-                            full_db_path if os.path.exists(full_db_path) else None
-                        )
-
+                    result["detected_plate"] = clean_txt
+                    result["confidence"] = float(ocr_prob)
                     result["message"] = f"ACCESS GRANTED (Match: {matched_key})"
                     return result
 
-                if prob > best_conf:
-                    best_conf = prob
-                    best_candidate = cleanup_text(text)
-                    best_box = curr_box
+                # Track best non-match
+                if ocr_prob > best_candidate_conf:
+                    best_candidate_conf = float(ocr_prob)
+                    best_candidate_text = clean_txt
 
-        if best_candidate:
-            result["detected_plate"] = best_candidate
-            result["message"] = "ACCESS DENIED"
-            if best_box:
-                cv2.rectangle(
-                    result["annotated_image"],
-                    (best_box[0], best_box[1]),
-                    (best_box[2], best_box[3]),
-                    (0, 0, 255),
-                    5,
-                )
+        # If no strict match found
+        if best_candidate_text:
+            # Try fuzzy match one last time
+            matched_key, match_score = find_best_match(best_candidate_text, DB_KEYS)
+            if matched_key:
+                result["matched"] = True
+                result["matched_plate"] = matched_key
+                result["detected_plate"] = best_candidate_text
+                result["confidence"] = best_candidate_conf
+                result["message"] = f"ACCESS GRANTED (Match: {matched_key})"
+            else:
+                result["detected_plate"] = best_candidate_text
+                result["message"] = "ACCESS DENIED"
         else:
-            result["message"] = "No Text Detected"
+            result["message"] = "Plate Detected, but OCR failed to read text."
 
     except Exception as e:
         print(f"Backend Error: {e}")
-        result["message"] = f"OCR Error: {e}"
+        result["message"] = f"Error: {e}"
 
     return result
+
+
+@app.route("/scan", methods=["POST"])
+def scan_plate():
+    if "image" not in request.files:
+        return jsonify({"error": "No image uploaded"}), 400
+
+    file = request.files["image"]
+    file_bytes = np.frombuffer(file.read(), np.uint8)
+    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+    data = process_image_from_memory(img)
+    return jsonify(data)
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
